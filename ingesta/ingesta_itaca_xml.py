@@ -191,6 +191,7 @@ def validar_claves(datos_totales):
 
     errores_alumnos = 0;
     errores_contenidos = 0;
+    alumnos_no_encontrados = set()
 
     for calificacion in datos_totales["calificaciones"]:
         alumno = calificacion.get("alumno")
@@ -198,22 +199,36 @@ def validar_claves(datos_totales):
 
         if alumno not in alumnos:
             errores_alumnos += 1
+            alumnos_no_encontrados.add(alumno)
 
         if contenido not in contenidos:
             errores_contenidos += 1
 
     logger.info(
-        f"Validación de claves: {errores_alumnos} calificaciones con NIA no encontrado, "
-        f"{errores_contenidos} calificaciones con contenido no encontrado."
+        "Validación de claves: %d calificaciones con NIA no encontrado "
+        "(%d identificadores distintos), %d calificaciones con contenido no encontrado.",
+        errores_alumnos,
+        len(alumnos_no_encontrados),
+        errores_contenidos
     )
 
     if errores_alumnos == 0 and errores_contenidos == 0:
         logger.info("Todas las claves de calificaciones son válidas.")
     else:
-        logger.warning(
-            "Se encontraron errores en las claves de calificaciones. "
-            "Revisar los registros para más detalles."
-        )
+        if errores_alumnos > 0:
+            logger.warning(
+                "Se encontraron %d calificaciones asociadas a %d identificadores "
+                "de alumno que no aparecen en las exportaciones disponibles.",
+                errores_alumnos,
+                len(alumnos_no_encontrados)
+                )
+
+        if errores_contenidos > 0:
+            logger.warning(
+                "Se encontraron %d calificaciones asociadas a contenidos que "
+                "no aparecen en las exportaciones disponibles.",
+                errores_contenidos
+            )
 
     return errores_alumnos, errores_contenidos
 
