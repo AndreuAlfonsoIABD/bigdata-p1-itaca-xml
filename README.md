@@ -178,3 +178,182 @@ Captura de las comprobaciones realizadas sobre las referencias de alumnos y cont
 - [x] Validación de referencias entre alumnos, calificaciones y contenidos.
 - [x] Incidencia de 133 calificaciones con 6 identificadores de alumno no encontrados identificada y documentada.
 - [x] Capturas de las evidencias incorporadas al README.
+
+## Práctica · Bloque 2: grafos con Neo4j
+
+La práctica modela las relaciones entre alumnos, módulos y grupos a partir de los JSON anonimizados de `data/raw/`. El grafo se construye desde los datos ya ingeridos, sin volver a leer los XML de origen.
+
+### Modelo
+
+```mermaid
+erDiagram
+    ALUMNO }o--o{ MODULO : CURSA
+    ALUMNO }o--o{ GRUPO : PERTENECE_A
+```
+
+- `Alumno` representa a una persona anonimizada dentro de un año académico. Sus propiedades académicas incluyen ciclo, grado, familia y turno; los códigos de curso del fichero de alumnos se conservan como contexto.
+- `Modulo` conserva el código y nombre del contenido, además del curso al que pertenece.
+- `Grupo` se identifica por año académico y código.
+- `CURSA` enlaza alumno y módulo y guarda evaluación, nota, bloque de contenido y tipo de nota.
+- `PERTENECE_A` enlaza alumno y grupo.
+
+La identidad de `Alumno` es `(nia, anyo)`; la de `Modulo`, `(codigo, anyo, curso_codigo)`; y la de `Grupo`, `(codigo, anyo)`. Los JSON acumulan varios cursos académicos y un NIA o código puede reaparecer en años distintos.
+
+Los campos `ciclo`, `grado` y `familia` del alumno se derivan recorriendo la jerarquía `padre` de `cursos`. Si hay varios códigos de curso para un mismo NIA y año, se guardan todos en `cursos_codigo` y se usa el más frecuente para describir el perfil del nodo. En cambio, las calificaciones se enlazan con el alumno por `alumno` + `Anyo`, y con el módulo por `contenido` + `Anyo` + `curso`.
+
+Esta diferencia es necesaria con los datos reales: en la instantánea usada, 1.992 calificaciones comparten NIA y año con un alumno, pero su código `curso` no coincide con el código del registro de alumno. Exigir que coincidan esos cursos perdería esas relaciones. Quedan sin enlazar 55 registros cuyo NIA solo aparece en otro año y 133 cuyo NIA no aparece en alumnos, incidencias que ya identifica la validación de la ingesta.
+
+### Preparación y despliegue
+
+Desde la raíz de este proyecto, copia `.env.example` a `.env` y sustituye el valor de `NEO4J_PASSWORD` por una contraseña local de al menos ocho caracteres. `.env` ya está excluido de Git. En este entorno ya se ha creado el `.env` local, así que no lo sobrescribas.
+
+Instala las dependencias en el entorno Python que uses:
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Arranca Neo4j y MongoDB solo si necesitas ambos servicios; para esta práctica basta Neo4j:
+
+```bash
+docker compose up -d neo4j
+```
+
+Abre <http://localhost:7474> e inicia sesión como `neo4j` con la contraseña definida en `.env`.
+
+### Carga de datos
+
+Ejecuta desde la raíz de este proyecto; el script también resuelve las rutas de los datos a partir de su propia ubicación:
+
+```bash
+.\.venv\Scripts\python.exe etl/cargar_neo4j.py
+```
+
+El script selecciona la fecha más reciente que tenga los cinco JSON (`alumnos`, `grupos`, `contenidos`, `cursos` y `calificaciones`). Usa `MERGE` y restricciones únicas compuestas (`Alumno`: NIA+año; `Modulo`: código+año+curso; `Grupo`: código+año), así se puede repetir la carga sin duplicar nodos ni relaciones.
+
+La ingesta anterior documenta calificaciones asociadas a algunos alumnos ausentes y referencias de grupo vacías. El cargador omite relaciones que no puede resolver y registra el número de filas omitidas por alumno, módulo o ambos. No inventa nodos para referencias sin correspondencia.
+
+### Consultas Cypher
+
+Primero, selecciona un NIA y un año presentes en el grafo. En Neo4j Browser:
+
+```cypher
+MATCH (a:Alumno)
+RETURN a.nia AS nia, a.anyo AS anyo
+LIMIT 10;
+```
+
+Define parámetros con uno de esos valores:
+
+```cypher
+:param nia => '0d5788cc76';
+:param anyo => '2025';
+:param otro_nia => '5e070e1aab';
+```
+
+Estos NIA son identificadores anonimizados de la instantánea `2026-11-23`. Para la consulta d se cambia temporalmente `nia` por `344a5ec7ab`.
+
+#### a) Compañeros de módulo
+
+```cypher
+MATCH (a:Alumno {nia: $nia, anyo: $anyo})-[:CURSA]->(m:Modulo)<-[:CURSA]-(companero:Alumno)
+WHERE companero.nia <> a.nia
+RETURN DISTINCT companero.nia AS nia_companero, m.codigo AS modulo, m.nombre AS nombre_modulo
+ORDER BY modulo, nia_companero;
+```
+
+La consulta parte de la matrícula elegida, recorre una relación `CURSA` hasta un módulo y vuelve por `CURSA` a los demás alumnos conectados a ese módulo.
+
+#### b) Módulos en común entre dos alumnos
+
+```cypher
+MATCH (a1:Alumno {nia: $nia, anyo: $anyo})-[:CURSA]->(m:Modulo)<-[:CURSA]-(a2:Alumno {nia: $otro_nia, anyo: $anyo})
+RETURN DISTINCT m.codigo AS modulo, m.nombre AS nombre_modulo
+ORDER BY modulo;
+```
+
+El mismo nodo `m` debe estar conectado a ambas matrículas, por lo que solo devuelve módulos compartidos.
+
+#### c) Camino más corto entre dos alumnos
+
+```cypher
+MATCH camino = shortestPath(
+  (a1:Alumno {nia: $nia, anyo: $anyo})-[*..6]-(a2:Alumno {nia: $otro_nia, anyo: $anyo})
+)
+RETURN camino;
+```
+
+El patrón sin tipo de relación permite recorrer tanto `CURSA` como `PERTENECE_A`, en cualquiera de las direcciones. El límite de seis relaciones evita una búsqueda sin cota. Si no existe conexión dentro de ese límite, no se devuelve camino.
+
+#### d) Alumnos con perfil similar en otro grupo
+
+```cypher
+MATCH (a1:Alumno {nia: $nia, anyo: $anyo})-[:PERTENECE_A]->(g1:Grupo)
+MATCH (a2:Alumno {anyo: $anyo})-[:PERTENECE_A]->(g2:Grupo)
+WHERE a1.nia <> a2.nia
+  AND a1.ciclo = a2.ciclo
+  AND a1.grado = a2.grado
+  AND a1.familia = a2.familia
+  AND g1 <> g2
+RETURN DISTINCT a2.nia AS nia, g2.codigo AS grupo
+ORDER BY grupo, nia;
+```
+
+Compara propiedades de alumnos del mismo año y exige que pertenezcan a grupos diferentes. Los campos académicos se obtienen de la jerarquía de cursos; si falta esa jerarquía en los datos de una matrícula, no se fuerza una coincidencia.
+
+#### e) Módulos que conectan varios grupos
+
+```cypher
+MATCH (m:Modulo)<-[:CURSA]-(a:Alumno)-[:PERTENECE_A]->(g:Grupo)
+WITH m, collect(DISTINCT g.codigo) AS grupos
+WHERE size(grupos) > 1
+RETURN m.codigo AS modulo, m.nombre AS nombre_modulo, grupos
+ORDER BY size(grupos) DESC;
+```
+
+La consulta agrupa por módulo y reúne los códigos de grupo distintos conectados a través de los alumnos. Los módulos asociados a más de un grupo pueden ser útiles para estudiar grupos que comparten carga lectiva.
+
+### Interpretación y comparación
+
+- **SQL relacional:** representa las entidades en tablas normalizadas. Para estas consultas se enlazarían matrículas, calificaciones, contenidos y grupos con varios `JOIN`; los recorridos de longitud variable suelen necesitar consultas recursivas.
+- **MongoDB:** los documentos funcionan bien para leer un alumno junto con sus datos anidados, pero explorar relaciones cambiantes entre alumnos, módulos y grupos puede exigir varios `$lookup`.
+- **Neo4j:** las relaciones son elementos del modelo y Cypher describe directamente los recorridos entre nodos. Esto hace más natural expresar caminos y vecindades; no significa que sea siempre más rápido o mejor para consultas tabulares o agregaciones.
+
+### Evidencias de ejecución
+
+La carga y las cinco consultas se ejecutaron contra Neo4j usando la instantánea raw del `2026-11-23`. La consulta c confirma que dos alumnos conectados por un módulo tienen un camino de longitud 2; la consulta d devuelve tres alumnos con el mismo ciclo, grado y familia, pero otro grupo.
+
+#### Conteos cargados
+
+| Elemento | Cantidad |
+| -------- | -------: |
+| Nodos `Alumno` | 7.070 |
+| Nodos `Modulo` | 1.688 |
+| Nodos `Grupo` | 257 |
+| Relaciones `PERTENECE_A` | 7.106 |
+| Relaciones `CURSA` | 106.626 |
+| Calificaciones omitidas por NIA/año sin correspondencia | 188 |
+
+Las 188 filas omitidas se componen de 55 referencias cuyo NIA solo aparece en otro año y 133 cuyo NIA no aparece en los alumnos de la ingesta. No se encontraron calificaciones sin módulo correspondiente ni filas sin ambos extremos.
+
+#### Resultados de ejemplo
+
+- **a) Compañeros:** para `0d5788cc76` en 2025 aparece, entre otros, `5e070e1aab` en el módulo `0491` («Sistemas de gestión empresarial»).
+- **b) Módulos comunes:** `0d5788cc76` y `5e070e1aab` comparten `0491` («Sistemas de gestión empresarial») y `0492` («Proyecto de Desarrollo de aplicaciones multiplataforma»).
+- **c) Camino más corto:** `Alumno 0d5788cc76 → Modulo 0491 → Alumno 5e070e1aab` (dos relaciones).
+- **d) Perfil similar en otro grupo:** para `344a5ec7ab` en 2025 se encontraron `5190538ecb`, `6865870ac9` y `b2f7db79e2` en el grupo `2CFSJ`.
+- **e) Módulos puente:** el primer resultado de esta instantánea es el módulo `028505` («Técnicas de ayuda odontológica/estomatológica»), conectado a seis grupos en una de sus ofertas de curso.
+
+Las capturas siguientes muestran el camino más corto como grafo y la tabla de compañeros de módulo en Neo4j Browser.
+
+![Camino más corto entre alumnos a través de un módulo](evidencias/grafos/01_camino_mas_corto.png)
+
+![Compañeros de módulo en formato tabla](evidencias/grafos/02_companeros_modulo.png)
+
+#### Reflexión
+
+En SQL el modelo se expresa con tablas y claves foráneas, y para encontrar compañeros o caminos entre grupos y módulos hay que enlazar varias tablas o formular recorridos recursivos. MongoDB facilita leer documentos de alumno con datos anidados, pero estas relaciones cruzadas suelen traducirse en varios `$lookup`. En Neo4j, el patrón de conexiones se representa directamente y Cypher recorre los nodos relacionados con una consulta breve. SQL y MongoDB siguen siendo opciones adecuadas para filtros, transacciones o lecturas centradas en un documento; el grafo aporta claridad cuando la pregunta depende de recorrer relaciones.
+
+Los conteos y ejemplos corresponden a esta instantánea y pueden variar cuando cambien los JSON raw.
+

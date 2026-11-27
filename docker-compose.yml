@@ -9,8 +9,22 @@ services:
     networks:
       - bigdata-net
 
+  neo4j:
+    image: neo4j:5
+    container_name: bigdata-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Define NEO4J_PASSWORD in .env}
+    volumes:
+      - neo4j-data:/data
+    networks:
+      - bigdata-net
+
 volumes:
   mongo-data:
+  neo4j-data:
 
 networks:
   bigdata-net:
