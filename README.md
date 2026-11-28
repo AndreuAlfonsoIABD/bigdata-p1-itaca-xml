@@ -35,21 +35,27 @@ bigdata-p1-itaca-xml/
 ├── ingesta/
 │   └── ingesta_itaca_xml.py
 ├── etl/
+│   ├── aplanar_cursos.py
+│   ├── cargar_mongodb.py
+│   ├── cargar_neo4j.py
+│   └── modulos_con_curso.py
 ├── dashboard/
 ├── evidencias/
 │   ├── 01_script_ingesta.png
 │   ├── 02_xml_exportaciones.png
 │   ├── 03_ejecucion_ingesta.png
 │   ├── 04_json_generados.png
-│   └── 05_validacion_registros.png
+│   ├── 05_validacion_registros.png
+│   ├── mongodb/
+│   └── grafos/
 ├── .gitignore
 ├── docker-compose.yml
 └── README.md
 ```
 
-Las carpetas `data/exportaciones/` y `data/raw/` se utilizan para trabajar con los datos localmente.
+Las carpetas `data/exportaciones/`, `data/raw/` y `data/trusted/` se utilizan para trabajar con los datos localmente.
 
-Están excluidas del repositorio mediante `.gitignore`, por lo que los archivos XML y JSON no se suben a GitHub.
+Están excluidas del repositorio mediante `.gitignore`, por lo que los archivos XML y JSON, incluidos los ficheros intermedios aplanados, no se suben a GitHub.
 
 La carpeta `evidencias/` contiene las capturas realizadas durante la práctica.
 
@@ -356,4 +362,88 @@ Las capturas siguientes muestran el camino más corto como grafo y la tabla de c
 En SQL el modelo se expresa con tablas y claves foráneas, y para encontrar compañeros o caminos entre grupos y módulos hay que enlazar varias tablas o formular recorridos recursivos. MongoDB facilita leer documentos de alumno con datos anidados, pero estas relaciones cruzadas suelen traducirse en varios `$lookup`. En Neo4j, el patrón de conexiones se representa directamente y Cypher recorre los nodos relacionados con una consulta breve. SQL y MongoDB siguen siendo opciones adecuadas para filtros, transacciones o lecturas centradas en un documento; el grafo aporta claridad cuando la pregunta depende de recorrer relaciones.
 
 Los conteos y ejemplos corresponden a esta instantánea y pueden variar cuando cambien los JSON raw.
+
+## Práctica · Bloque 2: carga y modelado documental en MongoDB
+
+### Despliegue y ejecución
+
+El servicio `mongo-express` permite explorar la base en <http://localhost:8081> (acceso web de clase: `admin` / `pass`). MongoDB usa el volumen persistente `mongo-data` y no tiene autenticación en este Compose. Ambos servicios deben mantenerse en el entorno local de prácticas.
+
+```powershell
+docker compose up -d mongo mongo-express
+pip install pymongo
+python etl/cargar_mongodb.py
+```
+
+El cargador selecciona la fecha más reciente que comparten los JSON de Alumnos, Calificaciones, Contenidos y Cursos. Se puede fijar otra con `$env:ITACA_SNAPSHOT="2026-11-23"` en PowerShell. Las filas se identifican por instantánea y posición de origen, en lugar de imponer unicidad por alumno: así se conservan incluso los registros repetidos presentes en la ingesta. Al repetir la carga, reemplaza solo los documentos que llevan `origen: "ITACA"`.
+
+### Modelo documental y decisiones
+
+```mermaid
+flowchart LR
+    A[alumnos<br/>una fila de matrícula por documento] -->|nia + anyo| C[calificaciones<br/>una fila origen por documento]
+    C -->|modulo / contenido| M[modulos<br/>una fila de Contenidos por documento]
+    M -->|curso embebido| K[datos aplanados de Cursos]
+    C -. grupos derivados para agregación .-> G[grupo]
+```
+
+- `alumnos` mantiene las matrículas separadas para poder consultarlas y actualizarlas de forma independiente.
+- `calificaciones` conserva un documento por fila y no anida el histórico en el alumno. Sus campos `nia`, `anyo`, `curso_codigo` y `modulo` facilitan el análisis. En seis filas `nota_numerica` venía vacía o no numérica; se carga como `null` sin descartar la fila.
+- `modulos` procede de Contenidos. `etl/aplanar_cursos.py` sigue el campo `padre` de Cursos para generar la jerarquía de nombres; `etl/modulos_con_curso.py` la incorpora como subdocumento `curso`. Esta relación estable queda embebida para evitar un `$lookup` frecuente.
+- Los JSON reales llaman al alumno de una nota `alumno`, al módulo `contenido` y a la nota `nota_numerica`. El ETL adapta estos nombres a `nia`, `modulo` y `nota`. Los códigos de curso se conservan en `curso_codigo`, y `curso` contiene la jerarquía legible derivada de Cursos.
+- `grupos` en cada calificación es una copia derivada desde la matrícula por NIA y año. Permite calcular notas por grupo sin ejecutar un `$lookup` para cada una de las más de cien mil calificaciones. Si hay más de un grupo asociado, se conserva la lista y la consulta la desglosa.
+
+### Índices y consultas
+
+El cargador crea índices no únicos porque la práctica debe conservar cada fila original:
+
+| Índice | Propósito |
+| ------ | --------- |
+| `alumno_contexto` (`nia`, `anyo`, `curso_codigo`) | Localizar matrícula por alumno y contexto. |
+| `modulo_contexto` (`codigo`, `anyo`, `curso_codigo`) | Buscar contenido y curso asociado. |
+| `curso_evaluacion` (`curso`, `evaluacion`) | Filtrar calificaciones para consultas del curso. |
+| `calificacion_contexto` (`nia`, `anyo`, `curso_codigo`, `modulo`, `evaluacion`) | Consultar el historial de una matrícula y módulo. |
+| `grupo_evaluacion` (`grupos`, `evaluacion`) | Filtrar agregaciones académicas por grupo/evaluación. |
+
+El ejemplo del enunciado se adapta a la etiqueta real del curso, ya que este snapshot contiene ciclos y cursos de varios años, y no una etiqueta `2ºDAM`. Por ejemplo, esta consulta real encuentra calificaciones:
+
+```javascript
+db.calificaciones.find({
+  curso: "SANIDAD / GRADO MEDIO / CUIDADOS AUXILIARES DE ENFERMERÍA / Primero"
+}).limit(5)
+```
+
+Para consultar la nota media por grupo en la primera evaluación:
+
+```javascript
+db.calificaciones.aggregate([
+  { $match: { origen: "ITACA", evaluacion: "01", nota: { $ne: null } } },
+  { $unwind: "$grupos" },
+  { $group: {
+      _id: "$grupos",
+      nota_media: { $avg: "$nota" },
+      num_calificaciones: { $sum: 1 }
+  } },
+  { $sort: { nota_media: -1 } },
+  { $limit: 10 }
+])
+```
+
+### Verificación de esta ejecución
+
+Instantánea local `2026-11-23`:
+
+| Colección | Documentos MongoDB | Filas JSON |
+| --------- | -----------------: | ---------: |
+| `alumnos` | 7.193 | 7.193 |
+| `modulos` | 1.688 | 1.688 |
+| `calificaciones` | 106.814 | 106.814 |
+
+La carga terminó correctamente, convirtió las seis notas vacías/no numéricas a `null`, embebió el curso en los 1.688 módulos y creó los cinco índices documentados. Se conservaron también 188 calificaciones cuyo alumno no tiene matrícula coincidente por NIA y año; no reciben grupo y quedan fuera de la agregación por grupo. Las capturas de Mongo Express se guardan en `evidencias/mongodb/`.
+
+La agregación por grupo también se ejecutó sin errores. En esta ejecución, el grupo `1CFS_ASIR` encabezó el resultado con media `8,27` en 170 calificaciones de la primera evaluación. Los valores varían si cambia la instantánea.
+
+![Mongo Express muestra las tres colecciones ITACA](evidencias/mongodb/01_colecciones_cargadas.png)
+
+![Mongo Express muestra documentos de calificaciones e índices](evidencias/mongodb/02_calificaciones_cargadas.png)
 
